@@ -243,15 +243,15 @@ def compute_cohort_retention(
             user_cohorts[uid] = first_init
             user_return_times[uid] = returns
 
-    # 按周分组同期群
+    # 按周分组同期群（与归因结算共用同一周期对齐口径）
     period_seconds = period_days * 86400
     cohort_buckets: dict[int, set[str]] = defaultdict(set)  # week_number -> set of user_ids
     for uid, init_time in user_cohorts.items():
-        week = int(init_time // period_seconds)
+        week = _period_index(init_time, period_days)
         cohort_buckets[week].add(uid)
 
     sorted_weeks = sorted(cohort_buckets)
-    cohort_ids = [_week_label(w, period_days) for w in sorted_weeks]
+    cohort_ids = [_period_label(w, period_days) for w in sorted_weeks]
     matrix: list[list[float]] = []
 
     for wi, week in enumerate(sorted_weeks):
@@ -260,7 +260,7 @@ def compute_cohort_retention(
         if total == 0:
             matrix.append([0.0] * max_periods)
             continue
-        cohort_start = week * period_seconds
+        cohort_start = _period_start(week, period_days)
         period_rates: list[float] = []
         for p in range(max_periods):
             period_end = cohort_start + (p + 1) * period_seconds
@@ -273,7 +273,7 @@ def compute_cohort_retention(
             period_rates.append(rate)
         matrix.append(period_rates)
 
-    period_labels = [f"周{i + 1}" for i in range(max_periods)]
+    period_labels = _period_axis_labels(period_days, max_periods)
     return CohortMatrix(
         cohort_ids=cohort_ids,
         period_labels=period_labels,
@@ -303,11 +303,15 @@ def compute_attribution(
     touchpoints: list[dict[str, Any]],
     model: str = "linear",
     decay_half_life_days: float = 7.0,
+    *,
+    position_first_weight: float = 0.4,
+    position_last_weight: float = 0.4,
 ) -> AttributionResult:
     """计算归因权重分配。
 
     touchpoints: [{"name": str, "time": epoch_seconds}, ...]
     模型支持：first_touch, last_touch, linear, time_decay, position_based
+    position_based 的首次/末次权重可由模型配置覆盖，中间触点均分剩余权重。
     """
     if not touchpoints:
         return AttributionResult(touchpoints=[], weights=[], model=model)
@@ -333,10 +337,12 @@ def compute_attribution(
         if n == 1:
             weights = [1.0]
         else:
-            first_weight = 0.4
-            last_weight = 0.4
-            middle_share = 0.2
+            first_weight = max(0.0, float(position_first_weight))
+            last_weight = max(0.0, float(position_last_weight))
+            # 首末权重之和不超过1，剩余部分留给中间触点。
+            remaining = max(0.0, 1.0 - first_weight - last_weight)
             middle_count = n - 2
+            middle_share = remaining / middle_count if middle_count > 0 else 0.0
             weights = []
             for i in range(n):
                 if i == 0:
@@ -344,7 +350,7 @@ def compute_attribution(
                 elif i == n - 1:
                     weights.append(last_weight)
                 else:
-                    weights.append(middle_share / middle_count if middle_count > 0 else 0)
+                    weights.append(middle_share)
     else:  # linear
         weights = [1.0 / n] * n
 
@@ -354,6 +360,526 @@ def compute_attribution(
         weights = [w / total for w in weights]
 
     return AttributionResult(touchpoints=tp_names, weights=weights, model=model)
+
+
+# ---------------------------------------------------------------------------
+# 转化归因结算：按归因窗口关联触点与回访（转化）事件
+# ---------------------------------------------------------------------------
+
+ATTRIBUTION_MODELS = (
+    "first_touch", "last_touch", "linear", "time_decay", "position_based",
+)
+SETTLEMENT_BASES = ("touch_week", "return_week")
+DEFAULT_ATTRIBUTION_WINDOW_DAYS = 7.0
+
+
+def normalize_attribution_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """收敛归因结算口径，保证结算账单里的模型条件可复现。
+
+    支持字段：
+    - model: first_touch / last_touch / linear / time_decay / position_based
+    - window_days: 归因窗口阈值（天），None 表示不设上限
+    - decay_half_life_days: 时间衰减半衰期（天）
+    - position_first_weight / position_last_weight: U 型首末权重
+    - period_days: 留存周期长度（天）
+    - settle_basis: touch_week（渠道按触达周结算）/ return_week（运营按回访周复盘）
+    """
+    raw = dict(config or {})
+    model = str(raw.get("model", "linear")).strip().lower()
+    if model not in ATTRIBUTION_MODELS:
+        model = "linear"
+
+    window_raw = raw.get("window_days", DEFAULT_ATTRIBUTION_WINDOW_DAYS)
+    if window_raw is None:
+        window_days: float | None = None
+    else:
+        try:
+            window_days = max(0.0, float(window_raw))
+        except (TypeError, ValueError):
+            window_days = DEFAULT_ATTRIBUTION_WINDOW_DAYS
+
+    try:
+        half_life = max(0.0, float(raw.get("decay_half_life_days", 7.0)))
+    except (TypeError, ValueError):
+        half_life = 7.0
+
+    try:
+        first_weight = min(1.0, max(0.0, float(raw.get("position_first_weight", 0.4))))
+    except (TypeError, ValueError):
+        first_weight = 0.4
+    try:
+        last_weight = min(1.0, max(0.0, float(raw.get("position_last_weight", 0.4))))
+    except (TypeError, ValueError):
+        last_weight = 0.4
+
+    try:
+        period_days = max(1, int(raw.get("period_days", 7)))
+    except (TypeError, ValueError):
+        period_days = 7
+    basis = str(raw.get("settle_basis", "return_week")).strip().lower()
+    if basis not in SETTLEMENT_BASES:
+        basis = "touch_week" if basis in ("触达周", "touch") else "return_week"
+
+    return {
+        "model": model,
+        "window_days": window_days,
+        "decay_half_life_days": half_life,
+        "position_first_weight": first_weight,
+        "position_last_weight": last_weight,
+        "period_days": period_days,
+        "settle_basis": basis,
+    }
+
+
+# 周周期对齐到周一：epoch 0 是周四，向右平移 3 天即可让 7 天窗口从周一开始。
+_PERIOD_ALIGN_DAYS = 3
+
+
+def _period_offset_seconds(period_days: int) -> int:
+    return _PERIOD_ALIGN_DAYS * 86400 if period_days == 7 else 0
+
+
+def _period_index(epoch_seconds: float, period_days: int) -> int:
+    period_seconds = max(1, period_days) * 86400
+    return int((epoch_seconds + _period_offset_seconds(period_days)) // period_seconds)
+
+
+def _period_start(period_index: int, period_days: int) -> float:
+    period_seconds = max(1, period_days) * 86400
+    return period_index * period_seconds - _period_offset_seconds(period_days)
+
+
+def _period_label(period_index: int, period_days: int) -> str:
+    start = _period_start(period_index, period_days)
+    if period_days == 7:
+        return _week_label(start, period_days)
+    import datetime
+    begin = datetime.datetime.fromtimestamp(start, tz=datetime.timezone.utc)
+    return f"{begin:%Y%m%d}+{period_days}天"
+
+
+def _period_axis_labels(period_days: int, max_periods: int) -> list[str]:
+    """周期轴标签：7 天口径用「周N」，其余口径直接写明天数。"""
+    if period_days == 7:
+        return [f"周{i + 1}" for i in range(max_periods)]
+    return [f"{period_days * (i + 1)}天" for i in range(max_periods)]
+
+
+def conversions_from_events(
+    events: list[dict[str, Any]], return_event_name: str,
+) -> list[dict[str, Any]]:
+    """把回访事件转成转化记录，供归因结算使用。
+
+    重复提交的回访会在这里保留为多条，由结算层按 conversion_id 去重并计数，
+    这样账单能明确记录「重复提交只记一次权重」。
+    """
+    conversions: list[dict[str, Any]] = []
+    for e in events or []:
+        if str(e.get("event_name", "")) != return_event_name:
+            continue
+        uid = str(e.get("user_id", ""))
+        if not uid:
+            continue
+        try:
+            ctime = float(e.get("event_time", 0))
+        except (TypeError, ValueError):
+            continue
+        conversions.append({
+            "conversion_id": str(e.get("conversion_id") or f"{uid}:{int(ctime)}:{return_event_name}"),
+            "user_id": uid,
+            "conversion_time": ctime,
+            "conversion_name": return_event_name,
+        })
+    return conversions
+
+
+def _dedupe_touchpoints(
+    touchpoints: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    duplicates = 0
+    for tp in touchpoints:
+        uid = str(tp.get("user_id", ""))
+        channel = str(tp.get("channel") or tp.get("name") or "")
+        time_raw = tp.get("time", tp.get("touch_time"))
+        try:
+            ttime = float(time_raw)
+        except (TypeError, ValueError):
+            unique.append(tp)
+            continue
+        key = (uid, int(ttime), channel)
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        normalized = dict(tp)
+        normalized["user_id"] = uid
+        normalized["channel"] = channel
+        normalized["time"] = ttime
+        unique.append(normalized)
+    return unique, duplicates
+
+
+def settle_conversion_attribution(
+    conversions: list[dict[str, Any]],
+    touchpoints: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按归因窗口把触点权重结算到每一笔转化，生成可周期对账的明细。
+
+    结算规则：
+    1. 只有 touch_time <= conversion_time 且 conversion_time - touch_time 不超过
+       归因窗口的触点才算合格触点；晚于转化的触点一律无效。
+    2. 同一 conversion_id（回访）重复提交只结算一次权重。
+    3. settle_basis=touch_week 时，权重落在触点所在周期（渠道按触达周结算）；
+       settle_basis=return_week 时，权重全部落在转化所在周期（运营按回访周复盘）。
+    """
+    cfg = normalize_attribution_config(config)
+    period_days = cfg["period_days"]
+    window = cfg["window_days"]
+    window_seconds = None if window is None else window * 86400
+    basis = cfg["settle_basis"]
+
+    incoming = [dict(tp) for tp in (touchpoints or [])]
+    for conv in conversions or []:
+        for tp in conv.get("touchpoints") or []:
+            attached = dict(tp)
+            attached.setdefault("user_id", conv.get("user_id"))
+            incoming.append(attached)
+    unique_tps, duplicate_touchpoints = _dedupe_touchpoints(incoming)
+
+    tp_by_user: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for tp in unique_tps:
+        tp_by_user[str(tp.get("user_id", ""))].append(tp)
+
+    seen_conversions: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    unattributed: list[dict[str, Any]] = []
+    excluded_touchpoints: list[dict[str, Any]] = []
+    invalid_touchpoints = 0
+    duplicate_submissions = 0
+    attributed_conversions = 0
+
+    for conv in conversions or []:
+        uid = str(conv.get("user_id", ""))
+        try:
+            ctime = float(conv.get("conversion_time", conv.get("time", 0)))
+        except (TypeError, ValueError):
+            continue
+        conversion_id = str(
+            conv.get("conversion_id") or f"{uid}:{int(ctime)}:{conv.get('conversion_name', '')}"
+        )
+        if conversion_id in seen_conversions:
+            duplicate_submissions += 1
+            continue
+        seen_conversions.add(conversion_id)
+
+        qualified: list[dict[str, Any]] = []
+        for tp in tp_by_user.get(uid, []):
+            ttime = tp.get("time")
+            if ttime is None:
+                invalid_touchpoints += 1
+                excluded_touchpoints.append({
+                    "conversion_id": conversion_id, "channel": tp.get("channel", ""),
+                    "touch_time": None, "reason": "触点缺少时间",
+                })
+                continue
+            ttime = float(ttime)
+            if ttime > ctime:
+                # 晚于转化的触点无效，不能参与归因。
+                invalid_touchpoints += 1
+                excluded_touchpoints.append({
+                    "conversion_id": conversion_id, "channel": tp.get("channel", ""),
+                    "touch_time": ttime, "reason": "晚于转化时间",
+                })
+                continue
+            if window_seconds is not None and ctime - ttime > window_seconds:
+                invalid_touchpoints += 1
+                excluded_touchpoints.append({
+                    "conversion_id": conversion_id, "channel": tp.get("channel", ""),
+                    "touch_time": ttime, "reason": f"超出归因窗口（{window:g}天）",
+                })
+                continue
+            qualified.append({"name": str(tp.get("channel", "")), "time": ttime})
+
+        if not qualified:
+            unattributed.append({
+                "conversion_id": conversion_id,
+                "user_id": uid,
+                "conversion_time": ctime,
+                "reason": "窗口内无合格触点",
+            })
+            continue
+
+        qualified.sort(key=lambda tp: tp["time"])
+        result = compute_attribution(
+            qualified,
+            model=cfg["model"],
+            decay_half_life_days=cfg["decay_half_life_days"],
+            position_first_weight=cfg["position_first_weight"],
+            position_last_weight=cfg["position_last_weight"],
+        )
+        attributed_conversions += 1
+        conversion_period = _period_index(ctime, period_days)
+
+        for tp, weight in zip(qualified, result.weights):
+            touch_period = _period_index(tp["time"], period_days)
+            settlement_period = touch_period if basis == "touch_week" else conversion_period
+            rows.append({
+                "conversion_id": conversion_id,
+                "user_id": uid,
+                "conversion_time": ctime,
+                "conversion_period": conversion_period,
+                "conversion_period_label": _period_label(conversion_period, period_days),
+                "channel": tp["name"],
+                "touch_time": tp["time"],
+                "touch_period": touch_period,
+                "touch_period_label": _period_label(touch_period, period_days),
+                "settlement_period": settlement_period,
+                "settlement_period_label": _period_label(settlement_period, period_days),
+                "weight": round(weight, 6),
+                "model": cfg["model"],
+                "window_days": window,
+                "settle_basis": basis,
+            })
+
+    rows.sort(key=lambda row: (row["settlement_period"], row["conversion_id"], row["touch_time"]))
+
+    period_buckets: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        bucket = period_buckets.setdefault(row["settlement_period"], {
+            "period_index": row["settlement_period"],
+            "period_label": row["settlement_period_label"],
+            "total_weight": 0.0,
+            "channels": defaultdict(float),
+            "conversion_ids": set(),
+        })
+        bucket["total_weight"] += row["weight"]
+        bucket["channels"][row["channel"]] += row["weight"]
+        bucket["conversion_ids"].add(row["conversion_id"])
+
+    period_summary: list[dict[str, Any]] = []
+    for period_index in sorted(period_buckets):
+        bucket = period_buckets[period_index]
+        total = round(bucket["total_weight"], 6)
+        channels = {
+            channel: round(weight, 6)
+            for channel, weight in sorted(
+                bucket["channels"].items(), key=lambda item: (-item[1], item[0]),
+            )
+        }
+        period_summary.append({
+            "period_index": period_index,
+            "period_label": bucket["period_label"],
+            "conversion_count": len(bucket["conversion_ids"]),
+            "total_weight": total,
+            "channels": channels,
+            "channel_share": {
+                channel: round(weight / total * 100, 2) if total else 0.0
+                for channel, weight in channels.items()
+            },
+        })
+
+    return {
+        "ok": True,
+        "caliber": {
+            **cfg,
+            "window_rule": "触点时间 <= 转化时间，且转化时间 - 触点时间 <= 归因窗口",
+            "settlement_basis_label": (
+                "渠道按触达周结算" if basis == "touch_week" else "运营按回访周复盘"
+            ),
+            "dedup_rule": "同一 conversion_id 重复提交只结算一次权重",
+        },
+        "conversions": rows,
+        "unattributed": unattributed,
+        "excluded_touchpoints": excluded_touchpoints,
+        "period_summary": period_summary,
+        "totals": {
+            "submitted_conversions": len(conversions or []),
+            "unique_conversions": len(seen_conversions),
+            "attributed_conversions": attributed_conversions,
+            "unattributed_conversions": len(unattributed),
+            "duplicate_submissions": duplicate_submissions,
+            "touchpoints": len(unique_tps),
+            "duplicate_touchpoints": duplicate_touchpoints,
+            "invalid_touchpoints": invalid_touchpoints,
+            "attributed_weight": round(sum(row["weight"] for row in rows), 6),
+        },
+    }
+
+
+def cohort_assignments(
+    events: list[dict[str, Any]],
+    init_event_name: str,
+    period_days: int = 7,
+) -> dict[str, dict[str, Any]]:
+    """按用户首次初始事件划分同期群，返回用户 → 群组周期。"""
+    first_init: dict[str, float] = {}
+    for e in events or []:
+        if str(e.get("event_name", "")) != init_event_name:
+            continue
+        uid = str(e.get("user_id", ""))
+        if not uid:
+            continue
+        try:
+            etime = float(e.get("event_time", 0))
+        except (TypeError, ValueError):
+            continue
+        if uid not in first_init or etime < first_init[uid]:
+            first_init[uid] = etime
+    return {
+        uid: {
+            "cohort_time": t,
+            "cohort_period": _period_index(t, period_days),
+            "cohort_id": _period_label(_period_index(t, period_days), period_days),
+        }
+        for uid, t in first_init.items()
+    }
+
+
+def build_cohort_attribution_matrix(
+    events: list[dict[str, Any]],
+    attribution_rows: list[dict[str, Any]],
+    init_event_name: str,
+    config: dict[str, Any] | None = None,
+    max_periods: int = 8,
+    cohort_matrix: CohortMatrix | None = None,
+) -> dict[str, Any]:
+    """留存分析读取转化归因明细，按明示的周期口径计算渠道贡献矩阵。
+
+    分母固定为同期群初始事件用户数（去重），与结算口径无关：
+    - touch_week：权重按触点所在周期入列（渠道按触达周结算）
+    - return_week：权重按转化所在周期入列（运营按回访周复盘）
+    这样同一笔跨期转化只改变列归属，不改变任何周期的分母。
+    传入 cohort_matrix 时，群组行与保留率矩阵的 cohort_ids 一一对齐。
+    """
+    cfg = normalize_attribution_config(config)
+    period_days = cfg["period_days"]
+    period_seconds = period_days * 86400
+    period_labels = _period_axis_labels(period_days, max_periods)
+    assignments = cohort_assignments(events, init_event_name, period_days)
+    if not assignments:
+        return {
+            "ok": True,
+            "caliber": {**cfg, "denominator": "同期群初始事件用户数（去重）"},
+            "cohort_ids": [],
+            "period_labels": period_labels,
+            "denominators": [],
+            "rows": [],
+            "channel_contributions": [],
+            "unmatched_weight": 0.0,
+            "outside_range_weight": 0.0,
+        }
+
+    if cohort_matrix is not None and cohort_matrix.cohort_ids:
+        cohort_ids = list(cohort_matrix.cohort_ids)
+        cohort_starts = [
+            _period_start(cohort_period, period_days)
+            for cohort_period in sorted({item["cohort_period"] for item in assignments.values()})
+        ]
+    else:
+        starts = sorted({item["cohort_period"] for item in assignments.values()})
+        cohort_starts = [_period_start(start, period_days) for start in starts]
+        cohort_ids = [_period_label(start, period_days) for start in cohort_starts]
+
+    rows: list[dict[str, Any]] = []
+    unmatched_weight = 0.0
+    outside_range_weight = 0.0
+    channel_totals: dict[str, float] = defaultdict(float)
+    assigned_users: set[str] = set()
+
+    for cohort_index, cohort_start in enumerate(cohort_starts):
+        cohort_end = cohort_start + period_seconds
+        cohort_users = {
+            uid for uid, item in assignments.items()
+            if cohort_start <= item["cohort_time"] < cohort_end
+        }
+        assigned_users |= cohort_users
+        denominator = len(cohort_users)
+        # 相对周期 = 结算周期 - 同期群起始周期；保留率矩阵的 cohort_start 用
+        # 「首个有回访的周期」做基准，两者对齐后首期即第1列。
+        base_index = _period_index(cohort_start, period_days)
+        weights_by_period: dict[int, float] = defaultdict(float)
+        channels_by_period: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+        for row in attribution_rows:
+            uid = str(row.get("user_id", ""))
+            if uid not in cohort_users:
+                continue
+            offset = int(row.get("settlement_period", 0)) - base_index
+            if offset < 0 or offset >= max_periods:
+                outside_range_weight += float(row.get("weight", 0) or 0)
+                continue
+            weight = float(row.get("weight", 0) or 0)
+            weights_by_period[offset] += weight
+            channels_by_period[offset][str(row.get("channel", ""))] += weight
+            channel_totals[str(row.get("channel", ""))] += weight
+
+        periods: list[dict[str, Any]] = []
+        for offset in range(max_periods):
+            weight = round(weights_by_period.get(offset, 0.0), 6)
+            channels = {
+                channel: round(value, 6)
+                for channel, value in sorted(
+                    channels_by_period.get(offset, {}).items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            }
+            periods.append({
+                "period_label": period_labels[offset],
+                "period_offset": offset,
+                "total_weight": weight,
+                "conversion_rate_pct": round(weight / denominator * 100, 2) if denominator else 0.0,
+                "channels": channels,
+                "channel_rates_pct": {
+                    channel: round(value / denominator * 100, 2) if denominator else 0.0
+                    for channel, value in channels.items()
+                },
+            })
+
+        rows.append({
+            "cohort_id": cohort_ids[cohort_index] if cohort_index < len(cohort_ids) else _period_label(
+                _period_index(cohort_start, period_days), period_days,
+            ),
+            "cohort_index": cohort_index,
+            "denominator": denominator,
+            "periods": periods,
+        })
+
+    for row in attribution_rows:
+        if str(row.get("user_id", "")) not in assigned_users:
+            unmatched_weight += float(row.get("weight", 0) or 0)
+
+    total_weight = sum(row["weight"] for row in attribution_rows)
+    channel_contributions = [
+        {
+            "channel": channel,
+            "total_weight": round(weight, 6),
+            "share_pct": round(weight / total_weight * 100, 2) if total_weight else 0.0,
+        }
+        for channel, weight in sorted(channel_totals.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+    return {
+        "ok": True,
+        "caliber": {
+            **cfg,
+            "denominator": "同期群初始事件用户数（去重）",
+            "rate_formula": "周期归因权重 / 同期群分母 * 100",
+            "settlement_basis_label": (
+                "渠道按触达周结算" if cfg["settle_basis"] == "touch_week"
+                else "运营按回访周复盘"
+            ),
+        },
+        "cohort_ids": [row["cohort_id"] for row in rows],
+        "period_labels": period_labels,
+        "denominators": [row["denominator"] for row in rows],
+        "rows": rows,
+        "channel_contributions": channel_contributions,
+        "unmatched_weight": round(unmatched_weight, 6),
+        "outside_range_weight": round(outside_range_weight, 6),
+    }
 
 
 # ---------------------------------------------------------------------------

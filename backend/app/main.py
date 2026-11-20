@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.routers import ROUTERS
@@ -133,6 +134,73 @@ def segment_pipeline(
         "cohort": cohort_result,
         "attribution": attribution_results,
         "cached": True,
+    }
+
+
+# ---- 数据流2b: 归因窗口 → 转化归因结算 → 同期群留存渠道贡献 ----
+class AttributionSettlementPayload(BaseModel):
+    model_id: int = 1
+    config_id: int = 1
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    touchpoints: list[dict[str, Any]] = Field(default_factory=list)
+    model_overrides: dict[str, Any] = Field(default_factory=dict)
+    max_periods: int = 8
+
+
+@app.post("/api/analytics/attribution-settlement")
+def attribution_settlement(payload: AttributionSettlementPayload) -> dict[str, Any]:
+    """按归因窗口结算转化归因，并交给同期群口径输出渠道贡献。
+
+    入参不传 events 时使用内置跨期样例：同一笔转化落在第二个留存周期，
+    两个合格触点分别在首期和第二期，用来核对渠道归属周期与矩阵分母。
+    """
+    settlement_svc = service_for("attribution_model")
+    cohort_svc = service_for("cohort_analysis")
+    if any(s is None for s in [settlement_svc, cohort_svc]):
+        return {"ok": False, "message": "依赖服务未就绪"}
+
+    events = payload.events or _sample_cross_period_events()
+    touchpoints = payload.touchpoints or _sample_cross_period_touchpoints()
+    overrides = dict(payload.model_overrides)
+
+    settlement = settlement_svc.settle_conversions(
+        payload.model_id, _conversions_from_events(events), touchpoints, overrides,
+    )
+    if not settlement.get("ok"):
+        return settlement
+
+    analysis = cohort_svc.analyze_with_attribution(
+        payload.config_id, events, payload.model_id, touchpoints, overrides,
+        payload.max_periods,
+    )
+    if not analysis.get("ok"):
+        return analysis
+
+    return {
+        "ok": True,
+        "pipeline": "归因窗口→转化归因结算→同期群留存渠道贡献",
+        "settlement": settlement,
+        "cohort": analysis,
+        "reconcile": {
+            "attribution_weight_total": settlement["totals"]["attributed_weight"],
+            "cohort_weight_total": round(
+                sum(
+                    period["total_weight"]
+                    for row in analysis["cohort_attribution_matrix"]
+                    for period in row["periods"]
+                ), 6,
+            ),
+            "denominators": analysis["denominators"],
+            "denominator_rule": analysis["periods"]["denominator"],
+            "settlement_basis": analysis["periods"]["settlement_basis"],
+            "model_conditions": {
+                "model_id": payload.model_id,
+                "model": analysis["attribution_caliber"]["model"],
+                "window_days": analysis["attribution_caliber"]["window_days"],
+                "period_days": analysis["attribution_caliber"]["period_days"],
+                "overrides": overrides,
+            },
+        },
     }
 
 
@@ -288,6 +356,39 @@ def scheduler_topology() -> dict[str, Any]:
     return svc.topological_order()
 
 
+@app.get("/api/analytics/attribution/caliber/{model_id}")
+def attribution_caliber(model_id: int) -> dict[str, Any]:
+    """查看归因模型收敛后的结算口径（窗口、模型、周期、结算基数）。"""
+    svc = service_for("attribution_model")
+    if svc is None:
+        return {"ok": False, "message": "归因服务未就绪"}
+    caliber = svc.model_caliber(model_id)
+    if caliber is None:
+        return {"ok": False, "message": f"归因模型 {model_id} 不存在"}
+    return {"ok": True, "model_id": model_id, "caliber": caliber}
+
+
+@app.get("/api/analytics/attribution/bills")
+def attribution_bills(limit: int = 50) -> dict[str, Any]:
+    """历次转化归因结算账单（含模型条件，供按周期对账）。"""
+    svc = service_for("attribution_model")
+    if svc is None:
+        return {"ok": False, "message": "归因服务未就绪"}
+    return svc.list_bills(limit)
+
+
+@app.get("/api/analytics/attribution/bills/{bill_id}")
+def attribution_bill(bill_id: str) -> dict[str, Any]:
+    """单张结算账单。"""
+    svc = service_for("attribution_model")
+    if svc is None:
+        return {"ok": False, "message": "归因服务未就绪"}
+    bill = svc.get_bill(bill_id)
+    if bill is None:
+        return {"ok": False, "message": f"账单 {bill_id} 不存在"}
+    return {"ok": True, "bill": bill}
+
+
 # ---- 辅助数据生成函数 ----
 def _sample_behavior_data() -> list[dict[str, Any]]:
     return [
@@ -320,6 +421,45 @@ def _sample_touchpoints() -> list[dict[str, Any]]:
         {"name": "社交媒体", "time": 1698868800},
         {"name": "直接访问", "time": 1698883200},
     ]
+
+
+# 跨期样例：用户 u1 在首期注册并触达「内容社区」，第二期再次被「短信召回」触达，
+# 随后在第二期完成「登录」转化。转化落在第二个留存周期，两个合格触点分属首期与第二期。
+_CROSS_PERIOD_ANCHOR = 1698624000  # 2023-10-30 00:00:00 UTC，周一，周对齐起点
+_CROSS_PERIOD_PERIOD = 7 * 86400
+
+
+def _sample_cross_period_events() -> list[dict[str, Any]]:
+    return [
+        # u1 的同期群初始事件：首期注册
+        {"user_id": "u1", "event_name": "注册", "event_time": _CROSS_PERIOD_ANCHOR + 3600},
+        # u1 的转化：第二期回访（登录）
+        {"user_id": "u1", "event_name": "登录", "event_time": _CROSS_PERIOD_ANCHOR + _CROSS_PERIOD_PERIOD + 7200},
+        # 同一回访重复提交：结算时只记一次权重
+        {"user_id": "u1", "event_name": "登录", "event_time": _CROSS_PERIOD_ANCHOR + _CROSS_PERIOD_PERIOD + 7200},
+        # u2 首期注册，首期内转化，作为对照
+        {"user_id": "u2", "event_name": "注册", "event_time": _CROSS_PERIOD_ANCHOR + 7200},
+        {"user_id": "u2", "event_name": "登录", "event_time": _CROSS_PERIOD_ANCHOR + 2 * 86400},
+    ]
+
+
+def _sample_cross_period_touchpoints() -> list[dict[str, Any]]:
+    return [
+        # 首期合格触点：内容社区
+        {"user_id": "u1", "channel": "内容社区", "time": _CROSS_PERIOD_ANCHOR + 1800},
+        # 第二期合格触点：短信召回（紧随转化之前）
+        {"user_id": "u1", "channel": "短信召回", "time": _CROSS_PERIOD_ANCHOR + _CROSS_PERIOD_PERIOD + 3600},
+        # 晚于转化的触点：无效，不能参与归因
+        {"user_id": "u1", "channel": "线下活动", "time": _CROSS_PERIOD_ANCHOR + _CROSS_PERIOD_PERIOD + 86400},
+        # u2 的两个合格触点
+        {"user_id": "u2", "channel": "搜索广告", "time": _CROSS_PERIOD_ANCHOR + 5400},
+        {"user_id": "u2", "channel": "信息流广告", "time": _CROSS_PERIOD_ANCHOR + 86400},
+    ]
+
+
+def _conversions_from_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from app.analytics_engine import conversions_from_events
+    return conversions_from_events(events, "登录")
 
 
 def _sample_metric_timeseries() -> list[float]:

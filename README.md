@@ -77,5 +77,36 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 转化归因结算与同期群对账
+
+归因模型负责给出「触点权重怎么分」，同期群负责给出「按哪个周期看渠道贡献」，
+两者通过转化归因数据串联，口径都写在输出里，不靠约定俗成。
+
+- 归因模型收敛口径：`GET /api/analytics/attribution/caliber/{model_id}`
+  （模型类型、归因窗口天数、衰减半衰期、U 型首末权重、留存周期、结算基数）。
+- 结算 + 渠道贡献：`POST /api/analytics/attribution-settlement`，入参
+  `{model_id, config_id, model_overrides, events?, touchpoints?, max_periods?}`。
+  `model_overrides` 可临时改 `window_days`、`settle_basis`、`period_days` 等；
+  不传 `events`/`touchpoints` 时用内置跨期样例：同一笔转化落在第二个留存周期，
+  两个合格触点分别在首期和第二期。
+- 结算账单：`GET /api/analytics/attribution/bills`，每次重算都会留存一条账单并
+  记录当次使用的模型条件；`settlement.bill_id` 指向本次账单。
+- 归因模型页与同期群分析页底部会显示同一个结算工作台，可切换模型、窗口阈值和
+  周期口径后重算。
+
+结算规则：
+
+1. 只有 `touch_time <= conversion_time` 且差值不超过归因窗口的触点合格；
+   晚于转化或超出窗口的触点计入 `excluded_touchpoints`，不参与权重分配。
+2. 同一 `conversion_id`（同一回访）重复提交只结算一次，计入
+   `totals.duplicate_submissions`。
+3. `settle_basis=return_week`（运营按回访周复盘）把整笔转化的权重计入转化所在周期；
+   `settle_basis=touch_week`（渠道按触达周结算）把权重拆到各触点所在周期。
+   两种口径分母相同，都是「同期群初始事件用户数（去重）」，因此只改变列归属。
+4. 渠道贡献矩阵的周期轴由 `period_days` 决定（7 天显示为「周N」），
+   `reconcile` 段给出权重合计、分母与当次模型条件，可直接按账单对账。
+
+测试：`cd backend && .venv/bin/python -m unittest discover -s tests -v`
+
 领域：数据工程
 子方向：数据分析与数据应用

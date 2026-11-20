@@ -14,6 +14,8 @@ class BaseModuleService:
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
+    # 可选口径字段：未出现在列表列里，但登记时允许写入并参与业务计算。
+    EXTRA_FIELDS: list[str] = []
 
     def list_entries(
         self,
@@ -53,6 +55,9 @@ class BaseModuleService:
         rows = store.rows(self.MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
+        for field in self.EXTRA_FIELDS:
+            if field in values:
+                entry[field] = values.get(field)
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
